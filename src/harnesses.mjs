@@ -2,7 +2,7 @@
 //
 // Claude Code and Codex write JSONL transcripts that the hooks point to, so they are parsed here.
 // Pi and OpenCode have extension APIs instead: their integrations send the messages themselves,
-// already as [{ role, text, ts }], so nothing needs to be parsed for them.
+// already as [{ role, text, ts, model }] plus the working directory, so nothing is parsed for them.
 
 import fs from 'node:fs';
 import os from 'node:os';
@@ -71,7 +71,9 @@ const claude = {
   },
   parse(file) {
     const out = [];
+    let cwd = null;
     for (const e of activeChain(readJsonl(file))) {
+      cwd = e.cwd ?? cwd;
       if (e.isMeta || e.isCompactSummary || e.isVisibleInTranscriptOnly || e.isApiErrorMessage) continue;
       const content = e.message?.content;
       // A message typed while the agent is still working is stored as a queued command.
@@ -82,10 +84,10 @@ const claude = {
         if (Array.isArray(content) && content.some((b) => b.type === 'tool_result')) continue;
         out.push({ role: 'user', text: claudeUserText(textBlocks(content, ['text'])), ts: e.timestamp });
       } else if (e.type === 'assistant' && e.message?.model !== '<synthetic>') {
-        out.push({ role: 'assistant', text: stripReminders(textBlocks(content, ['text'])), ts: e.timestamp });
+        out.push({ role: 'assistant', text: stripReminders(textBlocks(content, ['text'])), ts: e.timestamp, model: e.message?.model });
       }
     }
-    return out;
+    return { messages: out, cwd };
   },
   // Plain stdout of UserPromptSubmit would be added to the model's context, so print nothing.
   hookOutput: () => '',
@@ -117,7 +119,11 @@ const codex = {
   },
   parse(file) {
     const out = [];
+    let cwd = null;
+    let model = null;
     for (const e of readJsonl(file)) {
+      if (e.type === 'session_meta') cwd = e.payload?.cwd ?? cwd;
+      if (e.type === 'turn_context') model = e.payload?.model ?? model;
       if (e.type !== 'response_item' || e.payload?.type !== 'message') continue;
       const { role, content = [] } = e.payload;
       if (role !== 'user' && role !== 'assistant') continue;
@@ -126,9 +132,9 @@ const codex = {
         .map((b) => b.text)
         .filter((t) => role === 'assistant' || !codexInjected(t))
         .join('\n\n');
-      out.push({ role, text, ts: e.timestamp });
+      out.push({ role, text, ts: e.timestamp, model: role === 'assistant' ? model : undefined });
     }
-    return out;
+    return { messages: out, cwd };
   },
   // Codex rejects plain text from a Stop hook; an empty JSON object means "no decision".
   hookOutput: (event) => (event === 'Stop' ? '{}' : ''),
@@ -136,6 +142,6 @@ const codex = {
 
 // --- Pi and OpenCode: messages arrive from their integrations -------------------------------------
 
-const pushed = { sessionEnv: [], findTranscript: () => null, parse: () => [], hookOutput: () => '' };
+const pushed = { sessionEnv: [], findTranscript: () => null, parse: () => ({ messages: [] }), hookOutput: () => '' };
 
 export const harnesses = { claude, codex, pi: pushed, opencode: pushed };

@@ -27,10 +27,10 @@ export default function (pi: ExtensionAPI) {
     const messages = ctx.sessionManager
       .getBranch()
       .filter((e: any) => e.type === "message" && (e.message?.role === "user" || e.message?.role === "assistant"))
-      .map((e: any) => ({ role: e.message.role, text: textOf(e.message.content), ts: e.timestamp }));
+      .map((e: any) => ({ role: e.message.role, text: textOf(e.message.content), ts: e.timestamp, model: e.message.model }));
     const child = spawn(BIN, ["hook", "pi"], { stdio: ["pipe", "ignore", "ignore"], detached: true });
     child.on("error", () => {});
-    child.stdin.end(JSON.stringify({ session_id: sid, messages, prompt }));
+    child.stdin.end(JSON.stringify({ session_id: sid, cwd: ctx.cwd, messages, prompt }));
     child.unref();
   }
 

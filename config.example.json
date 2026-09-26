@@ -2,7 +2,6 @@
   "vault": "/path/to/your/Obsidian vault",
   "folder": "AI Chats",
   "defaultTitle": "Chat",
-  "labels": { "user": "User", "assistant": "AI" },
   "frontmatter": {},
   "projects": { "fromActiveNote": false, "category": "[[Projects]]" }
 }

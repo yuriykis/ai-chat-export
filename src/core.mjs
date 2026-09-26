@@ -17,7 +17,6 @@ export const STATE_DIR = path.join(process.env.XDG_STATE_HOME || path.join(HOME,
 
 const DEFAULTS = {
   folder: 'AI Chats',
-  labels: { user: 'User', assistant: 'AI' },
   defaultTitle: 'Chat',
   frontmatter: {},
   projects: { fromActiveNote: false, category: '[[Projects]]' },
@@ -30,7 +29,6 @@ export function loadConfig() {
   return {
     ...DEFAULTS,
     ...user,
-    labels: { ...DEFAULTS.labels, ...user.labels },
     projects: { ...DEFAULTS.projects, ...user.projects },
     configFile: CONFIG_FILE,
   };
@@ -80,16 +78,18 @@ function normalize(items) {
     } else if (!skipping) {
       const prev = out.at(-1);
       if (prev?.role === 'assistant') prev.text += `\n\n${text}`;
-      else out.push({ role: 'assistant', text, ts: m.ts });
+      else out.push({ role: 'assistant', text, ts: m.ts, model: m.model });
     }
   }
   return out.filter((m, i) => !(m.role === 'user' && m.text.startsWith('/') && i < out.length - 1 && out[i + 1].role !== 'assistant'));
 }
 
-function collect(marker, { messages, prompt, reply }) {
+function collect(marker, { messages, prompt, reply, cwd }) {
   const h = harnesses[marker.harness];
-  const raw = messages ?? (marker.transcript && fs.existsSync(marker.transcript) ? h.parse(marker.transcript) : []);
-  const items = normalize(raw);
+  const parsed = messages
+    ? { messages, cwd }
+    : marker.transcript && fs.existsSync(marker.transcript) ? h.parse(marker.transcript) : { messages: [] };
+  const items = normalize(parsed.messages);
   // The Stop hook can run before the final reply reaches the transcript; the hook carries it too.
   const last = reply?.trim();
   if (last && items.length && !(items.at(-1).role === 'assistant' && items.at(-1).text.endsWith(last))) {
@@ -101,7 +101,8 @@ function collect(marker, { messages, prompt, reply }) {
   if (pending && !SAVE_COMMAND.test(pending) && items.findLast((m) => m.role === 'user')?.text !== pending) {
     items.push({ role: 'user', text: pending, ts: new Date().toISOString() });
   }
-  return items;
+  const models = [...new Set(items.map((m) => m.model).filter((m) => m && !m.startsWith('<')))];
+  return { harness: marker.harness, cwd: parsed.cwd ?? marker.cwd, models, messages: items };
 }
 
 // --- the note --------------------------------------------------------------------------------------
@@ -125,7 +126,7 @@ function write(cfg, marker, input = {}) {
     if (marker.written) { fs.rmSync(markerPath(marker.harness, marker.sid), { force: true }); return null; }
     file = marker.file;
   }
-  const body = renderBody(collect(marker, input), cfg.labels);
+  const body = renderBody(collect(marker, input));
   const today = ymd(new Date());
 
   let content;
@@ -203,6 +204,7 @@ export function start(opts) {
     harness,
     sid,
     transcript: harnesses[harness].findTranscript(sid),
+    cwd: process.cwd(),
     projects,
     created: ymd(now),
     file: uniqueFile(path.join(cfg.vault, cfg.folder), `${ymd(now)} ${title}`),
@@ -236,6 +238,7 @@ export function hook(harness, input) {
   }
   write(loadConfig(), marker, {
     messages: input.messages,
+    cwd: input.cwd,
     prompt: input.hook_event_name === 'UserPromptSubmit' || input.messages ? input.prompt : undefined,
     reply: input.hook_event_name === 'Stop' ? input.last_assistant_message : undefined,
   });

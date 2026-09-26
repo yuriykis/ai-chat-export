@@ -50,7 +50,6 @@ git clone https://github.com/yuriykis/ai-chat-export ~/Projects/ai-chat-export
   "vault": "/path/to/vault",
   "folder": "AI Chats",
   "defaultTitle": "Chat",
-  "labels": { "user": "User", "assistant": "AI" },
   "frontmatter": { "category": "[[AI Chats]]", "related": null },
   "projects": { "fromActiveNote": true, "category": "[[Projects]]" }
 }

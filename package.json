@@ -1,0 +1,9 @@
+{
+  "name": "ai-chat-export",
+  "version": "0.1.0",
+  "description": "Save conversations with coding agents (Claude Code, Codex, Pi, OpenCode) to an Obsidian vault, live, on demand.",
+  "type": "module",
+  "bin": { "ai-chat-export": "bin/ai-chat-export.mjs" },
+  "engines": { "node": ">=20" },
+  "license": "MIT"
+}

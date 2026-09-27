@@ -25,10 +25,14 @@ If you rename or move the note inside the folder, it is found again by its `sess
 
 Claude Code keeps a conversation as a tree. When you rewind to an earlier message and continue differently, the old path stays in the session file.
 
-- The note always shows the live path. A path left behind by a rewind gets a note of its own, `<title> (branch N)`, with only the messages after the point where it split off. It gets a note only if it holds a full exchange: a message of yours and a reply. A message you took back before any reply does not count.
-- A fork (`claude --resume <id> --fork-session`) of a conversation being recorded is recorded too, without asking, as a note of the same kind. Forks made before recording started are left alone.
-- Where a branch split off, the note it came from gets a line `↳ Branch: [[…]]` with a block id; the branch's info box links back to that exact line.
-- A branch note inherits `projects` from the note of the conversation. It has a `branch` property (the id of its first entry) so it is found again after a rename. Deleting it stops it from being written again.
+- **Rewind.** The note always shows the live path. A path left behind gets a note of its own, `<title> (branch N)`, with only the messages after the point where it split off. It gets a note only if it holds a full exchange: a message of yours and a reply. A message you took back before any reply does not count.
+- **Fork** (`claude --resume <id> --fork-session`). A fork is a new session and is not recorded until you ask. When you do, `start` finds the conversation it came from (an older transcript with the same first entries) and saves only what comes after the split:
+  - if that conversation has a note — being recorded or stopped — the fork becomes `<its title> (branch N)`, inherits `projects` without asking, and the split point in that note gets a link to it;
+  - otherwise it is an ordinary new note whose info box says it branched off an unsaved conversation, and at what time.
+- Where a branch split off, the note it came from gets a line `↳ Branch: [[…]]` with a block id; the branch's info box links back to that exact line. A note whose recording was stopped is rewritten for this only up to the moment it stopped.
+- Rewind branch notes have a `branch` property (the id of their first entry) so they are found again after a rename. A deleted branch note is not written again.
+
+`stop` keeps the session's marker, marked as stopped, so a later fork can still link to the note. Saving a stopped conversation again continues its note.
 
 Other agents are not covered yet: Pi and OpenCode notes show the live path only, and Codex rollbacks are not followed.
 

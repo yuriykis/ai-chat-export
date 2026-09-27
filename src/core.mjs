@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { harnesses } from './harnesses.mjs';
-import { renderBody, renderFrontmatter, yamlField, yamlValue, ymd } from './render.mjs';
+import { hm, renderBody, renderFrontmatter, yamlField, yamlValue, ymd } from './render.mjs';
 
 const HOME = os.homedir();
 const CONFIG_FILE = path.join(process.env.XDG_CONFIG_HOME || path.join(HOME, '.config'), 'ai-chat-export/config.json');
@@ -166,7 +166,9 @@ function write(cfg, marker, input = {}) {
   // Pi and OpenCode send the messages with each hook call. `start` and `stop` run without them, so
   // an existing note keeps its body instead of being rebuilt empty.
   if (h.pushed && !input.messages && fs.existsSync(file)) return file;
-  const paths = !input.messages && h.paths && marker.transcript && fs.existsSync(marker.transcript) ? h.paths(marker.transcript) : null;
+  let paths = !input.messages && h.paths && marker.transcript && fs.existsSync(marker.transcript) ? h.paths(marker.transcript) : null;
+  // A stopped recording is rewritten only to add a fork's line; what was said after it stopped stays out.
+  if (paths && marker.stoppedAt) paths = paths.map((p) => cutAt(p, Date.parse(marker.stoppedAt))).filter((p) => p.ids.length);
   const chat = collect(marker, input, paths?.[0]);
   const next = { ...marker, file, written: true };
   const notes = paths ? branchNotes(cfg, next, file, chat, paths) : [];
@@ -177,6 +179,14 @@ function write(cfg, marker, input = {}) {
   }
   if (JSON.stringify(next) !== JSON.stringify(marker)) saveMarker(next);
   return file;
+}
+
+function cutAt(p, time) {
+  const end = p.times.findIndex((t) => Date.parse(t) > time);
+  if (end < 0) return p;
+  const ids = p.ids.slice(0, end);
+  const kept = new Set(ids);
+  return { ...p, ids, times: p.times.slice(0, end), messages: p.messages.filter((m) => kept.has(m.uuid)) };
 }
 
 function newFrontmatter(cfg, marker) {
@@ -193,9 +203,9 @@ function newFrontmatter(cfg, marker) {
 //
 // Claude Code keeps a conversation as a tree. The note always shows the live path; a branch left
 // behind by a rewind gets a note of its own with the messages after the point where it split off.
-// A fork (`--fork-session`) is a new session and a new note, recorded the same way from its split.
-// The split point in the note it came from gets a line linking to the branch, with a block id the
-// branch links back to.
+// A fork (`--fork-session`) is a new session, saved only when asked, and then only from its split.
+// If the conversation it came from has a note, the split point there gets a line linking to the
+// fork, with a block id the fork links back to.
 
 const noteName = (file) => path.basename(file, '.md');
 const branchLine = (file, anchor) => `↳ Branch: [[${noteName(file)}]] ^${anchor}`;
@@ -230,10 +240,15 @@ function branchNotes(cfg, marker, file, chat, paths) {
   const main = { key: null, ids: live.ids, own: own(live.ids, marker.parent?.at), file, chat };
   if (marker.parent) {
     chat.messages = chat.messages.filter((m) => !m.uuid || main.own.has(m.uuid));
-    const parent = readMarker(marker.harness, marker.parent.sid);
-    const where = parent?.children?.find((c) => c.sid === marker.sid)?.note ?? marker.parent.note;
-    if (where) marker.parent = { ...marker.parent, note: where };
-    if (where && fs.existsSync(where)) chat.parentLink = backLink(where, `fork-${marker.sid.slice(0, 8)}`);
+    if (marker.parent.unsaved) {
+      const t = live.times[live.ids.indexOf(marker.parent.at)];
+      chat.parentLink = `an unsaved conversation${t ? `, ${ymd(new Date(t))} ${hm(new Date(t))}` : ''}`;
+    } else {
+      const parent = readMarker(marker.harness, marker.parent.sid);
+      const where = parent?.children?.find((c) => c.sid === marker.sid)?.note ?? marker.parent.note;
+      if (where) marker.parent = { ...marker.parent, note: where };
+      if (where && fs.existsSync(where)) chat.parentLink = backLink(where, `fork-${marker.sid.slice(0, 8)}`);
+    }
   }
   const notes = [main];
   const marks = [];
@@ -289,7 +304,8 @@ function branchNotes(cfg, marker, file, chat, paths) {
   for (const n of notes) {
     const index = new Map(n.ids.map((id, i) => [id, i]));
     n.chat.marks = marks.filter((m) => m.note === n).map((m) => {
-      const limit = index.get(m.at) ?? -1;
+      // A fork made after a recording stopped split off past the end of its note.
+      const limit = index.get(m.at) ?? Infinity;
       const after = n.chat.messages.findLastIndex((x) => (index.get(x.uuid) ?? Infinity) <= limit);
       return { after, line: m.line };
     });
@@ -299,52 +315,29 @@ function branchNotes(cfg, marker, file, chat, paths) {
   return notes;
 }
 
-// A fork of a conversation being recorded is a new session holding a copy of it. It is recorded too,
-// if it was made after recording started; otherwise it is left alone like any other session.
-function adoptFork(harness, sid, input) {
-  const h = harnesses[harness];
-  const file = input.transcript_path;
-  if (!h.paths || !file || !fs.existsSync(file) || !fs.existsSync(STATE_DIR)) return false;
-  const recorded = fs.readdirSync(STATE_DIR).filter((n) => n.startsWith(`${harness}--`) && n.endsWith('.json'));
-  if (!recorded.length) return false;
-  const root = h.firstId(file);
-  if (!root) return false;
-  let mine = null;
-  let best = null;
-  for (const name of recorded) {
-    let m;
-    try { m = JSON.parse(fs.readFileSync(path.join(STATE_DIR, name), 'utf8')); } catch { continue; }
-    // Already adopted once: its note was deleted, so it stays unrecorded.
-    if (m.children?.some((c) => c.sid === sid)) return false;
-    if (m.sid === sid || !m.transcript || !fs.existsSync(m.transcript) || h.firstId(m.transcript) !== root) continue;
-    mine ??= h.paths(file)[0];
-    const theirs = h.ids(m.transcript);
-    let k = 0;
-    while (k < mine.ids.length && theirs.has(mine.ids[k])) k++;
-    if (k === 0 || k === mine.ids.length) continue;
-    if (Date.parse(mine.times[k]) < Date.parse(m.startedAt ?? m.created)) continue;
-    if (!best || k > best.k) best = { m, k, at: mine.ids[k - 1] };
+// The recording of the conversation a fork was made from, if it has a note: its marker, or one rebuilt
+// for a recording stopped before markers were kept, treated as stopped when the note last changed.
+function originRecording(cfg, harness, origin) {
+  const m = readMarker(harness, origin.sid);
+  if (m) {
+    const note = locate(cfg, m);
+    return note ? { marker: m, note } : null;
   }
-  if (!best) return false;
-  const cfg = loadConfig();
-  const parentFile = locate(cfg, best.m);
-  if (!parentFile) return false;
-  const now = new Date();
-  saveMarker({
+  const note = locate(cfg, { harness, sid: origin.sid, file: '' });
+  if (!note) return null;
+  const fm = frontmatterOf(note);
+  const marker = {
     harness,
-    sid,
-    transcript: file,
-    cwd: input.cwd ?? best.m.cwd,
-    projects: linkedProjects(frontmatterOf(parentFile)),
-    created: ymd(now),
-    startedAt: now.toISOString(),
-    file: branchFile(cfg, parentFile, new Set()),
-    written: false,
-    parent: { sid: best.m.sid, at: best.at },
-  });
-  saveMarker({ ...best.m, children: [...(best.m.children ?? []), { sid, at: best.at }] });
-  write(cfg, loadMarker(harness, best.m.sid));
-  return true;
+    sid: origin.sid,
+    transcript: origin.transcript,
+    projects: linkedProjects(fm),
+    created: fm.match(/^created:\s*(\S+)/m)?.[1] ?? ymd(new Date()),
+    file: note,
+    written: true,
+    stopped: true,
+    stoppedAt: fs.statSync(note).mtime.toISOString(),
+  };
+  return { marker, note };
 }
 
 // --- project of the conversation ------------------------------------------------------------------
@@ -450,30 +443,46 @@ export function start(opts) {
   const cfg = loadConfig();
   const { harness, sid } = resolveSession(opts);
   const rel = (f) => path.relative(cfg.vault, f);
-  if (fs.existsSync(markerPath(harness, sid))) {
-    const file = write(cfg, loadMarker(harness, sid));
+  const existing = readMarker(harness, sid);
+  if (existing?.stopped) {
+    const { stopped, stoppedAt, ...resumed } = existing;
+    saveMarker(resumed);
+    const file = write(cfg, resumed);
+    if (file) return `Saving this conversation again to ${rel(file)}. Every new message is added as it happens.`;
+  } else if (existing) {
+    const file = write(cfg, existing);
     if (file) return `Already saving this conversation to ${rel(file)}.`;
   }
+  const h = harnesses[harness];
+  const transcript = h.findTranscript(sid);
+  const origin = transcript && h.forkOrigin ? h.forkOrigin(transcript) : null;
+  const from = origin && originRecording(cfg, harness, origin);
   const index = cfg.projects && projectIndex(cfg);
   const named = opts.project && opts.project !== true ? [opts.project] : [];
-  const projects = named.length ? resolveProjects(cfg, named, index) : [];
+  const projects = named.length ? resolveProjects(cfg, named, index) : from ? linkedProjects(frontmatterOf(from.note)) : [];
   const now = new Date();
   const title = (opts.title || projects[0] || cfg.defaultTitle).replace(/[\\/:*?"<>|#^[\]]/g, '').replace(/\s+/g, ' ').trim().slice(0, 100);
   const marker = {
     harness,
     sid,
-    transcript: harnesses[harness].findTranscript(sid),
+    transcript,
     cwd: process.cwd(),
     projects,
     created: ymd(now),
-    startedAt: now.toISOString(),
-    file: uniqueFile(path.join(cfg.vault, cfg.folder), `${ymd(now)} ${title}`),
+    file: from ? branchFile(cfg, from.note, new Set()) : uniqueFile(path.join(cfg.vault, cfg.folder), `${ymd(now)} ${title}`),
     written: false,
+    ...(origin && { parent: { sid: origin.sid, at: origin.at, ...(!from && { unsaved: true }) } }),
   };
   saveMarker(marker);
+  if (from) {
+    // The note it came from gets the line pointing here before this note is written, so both links exist.
+    saveMarker({ ...from.marker, children: [...(from.marker.children ?? []), { sid, at: origin.at }] });
+    write(cfg, loadMarker(harness, origin.sid));
+  }
   const file = write(cfg, marker);
-  const saving = `Saving this conversation to ${rel(file)}${projects.length ? ` (project: ${projects.join(', ')})` : ''}. Every new message is added as it happens.`;
-  if (!cfg.projects || projects.length) return saving;
+  const what = from ? `this fork of ${noteName(from.note)}` : origin ? 'this fork from where it split off' : 'this conversation';
+  const saving = `Saving ${what} to ${rel(file)}${projects.length ? ` (project: ${projects.join(', ')})` : ''}. Every new message is added as it happens.`;
+  if (!cfg.projects || projects.length || from) return saving;
   const suggested = suggestProjects(cfg, marker.cwd, index);
   return [
     saving,
@@ -491,7 +500,7 @@ export function project(opts) {
   const cfg = loadConfig();
   if (!cfg.projects) throw new Error(`Projects are off — add "projects" to ${cfg.configFile}.`);
   const { harness, sid } = resolveSession(opts);
-  if (!fs.existsSync(markerPath(harness, sid))) throw new Error('This conversation is not being saved — start saving it first.');
+  if (!readMarker(harness, sid) || readMarker(harness, sid).stopped) throw new Error('This conversation is not being saved — start saving it first.');
   if (!opts.none && !opts._.length) throw new Error('Give a project name, or --none for no project.');
   const projects = opts.none ? [] : resolveProjects(cfg, opts._, projectIndex(cfg));
   const marker = { ...loadMarker(harness, sid), projects, answeredAt: new Date().toISOString() };
@@ -512,9 +521,11 @@ export function project(opts) {
 export function stop(opts) {
   const cfg = loadConfig();
   const { harness, sid } = resolveSession(opts);
-  if (!fs.existsSync(markerPath(harness, sid))) return 'This conversation was not being saved.';
-  const file = write(cfg, loadMarker(harness, sid));
-  fs.rmSync(markerPath(harness, sid), { force: true });
+  const marker = readMarker(harness, sid);
+  if (!marker || marker.stopped) return 'This conversation was not being saved.';
+  const file = write(cfg, marker);
+  // The marker stays, marked stopped: a later fork of this conversation can still link to its note.
+  if (file) saveMarker({ ...readMarker(harness, sid), stopped: true, stoppedAt: new Date().toISOString() });
   return `Stopped saving. The note stays at ${file ? path.relative(cfg.vault, file) : '(deleted)'}.`;
 }
 
@@ -524,9 +535,9 @@ export function hook(harness, input) {
   const h = harnesses[harness];
   if (!h) return '';
   const sid = input.session_id;
-  if (!sid) return h.hookOutput(input.hook_event_name);
-  if (!fs.existsSync(markerPath(harness, sid)) && !adoptFork(harness, sid, input)) return h.hookOutput(input.hook_event_name);
+  if (!sid || !fs.existsSync(markerPath(harness, sid))) return h.hookOutput(input.hook_event_name);
   const marker = loadMarker(harness, sid);
+  if (marker.stopped) return h.hookOutput(input.hook_event_name);
   if (input.transcript_path && input.transcript_path !== marker.transcript) {
     marker.transcript = input.transcript_path;
     saveMarker(marker);

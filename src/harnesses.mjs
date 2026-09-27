@@ -132,6 +132,31 @@ const claude = {
   ids(file) {
     return new Set(claudeTree(file).byId.keys());
   },
+  // The session a fork was made from: an older transcript with the same first entry. Of those, the one
+  // sharing the longest start is the original (an older fork of the same original shares less).
+  // `at` is the last entry the fork copied.
+  forkOrigin(file) {
+    const root = this.firstId(file);
+    if (!root) return null;
+    const born = fs.statSync(file).birthtimeMs;
+    const live = this.paths(file)[0];
+    const dir = path.join(HOME, '.claude/projects');
+    let best = null;
+    for (const project of fs.existsSync(dir) ? fs.readdirSync(dir) : []) {
+      const sub = path.join(dir, project);
+      if (!fs.statSync(sub).isDirectory()) continue;
+      for (const name of fs.readdirSync(sub)) {
+        const other = path.join(sub, name);
+        if (!name.endsWith('.jsonl') || other === file || fs.statSync(other).birthtimeMs >= born) continue;
+        if (this.firstId(other) !== root) continue;
+        const theirs = this.ids(other);
+        let k = 0;
+        while (k < live.ids.length && theirs.has(live.ids[k])) k++;
+        if (k && (!best || k > best.k)) best = { k, sid: name.slice(0, -6), transcript: other, at: live.ids[k - 1], time: live.times[k - 1] };
+      }
+    }
+    return best;
+  },
   // The first entry of a transcript. A fork (`--fork-session`) copies the conversation with the same
   // ids into a new file, so a shared first entry is how a fork is recognised.
   firstId(file) {

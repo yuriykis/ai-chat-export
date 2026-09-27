@@ -5,7 +5,7 @@ import os from 'node:os';
 
 const pad = (n) => String(n).padStart(2, '0');
 export const ymd = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-const hm = (d) => `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+export const hm = (d) => `${pad(d.getHours())}:${pad(d.getMinutes())}`;
 
 const AGENT_NAMES = { claude: 'Claude Code', codex: 'Codex', pi: 'Pi', opencode: 'OpenCode' };
 

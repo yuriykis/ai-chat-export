@@ -21,6 +21,17 @@ The text is made safe for the vault: `- [ ]` is escaped so it does not become a 
 
 If you rename or move the note inside the folder, it is found again by its `session` property. If you delete it, recording stops and the note is not recreated.
 
+## Branches (Claude Code)
+
+Claude Code keeps a conversation as a tree. When you rewind to an earlier message and continue differently, the old path stays in the session file.
+
+- The note always shows the live path. A path left behind by a rewind gets a note of its own, `<title> (branch N)`, with only the messages after the point where it split off. It gets a note only if it holds a full exchange: a message of yours and a reply. A message you took back before any reply does not count.
+- A fork (`claude --resume <id> --fork-session`) of a conversation being recorded is recorded too, without asking, as a note of the same kind. Forks made before recording started are left alone.
+- Where a branch split off, the note it came from gets a line `↳ Branch: [[…]]` with a block id; the branch's info box links back to that exact line.
+- A branch note inherits `projects` from the note of the conversation. It has a `branch` property (the id of its first entry) so it is found again after a rename. Deleting it stops it from being written again.
+
+Other agents are not covered yet: Pi and OpenCode notes show the live path only, and Codex rollbacks are not followed.
+
 ## Install
 
 Requires Node.js 20+.
@@ -51,11 +62,13 @@ git clone https://github.com/yuriykis/ai-chat-export ~/Projects/ai-chat-export
   "folder": "AI Chats",
   "defaultTitle": "Chat",
   "frontmatter": { "category": "[[AI Chats]]", "related": null },
-  "projects": { "category": "[[Projects]]" }
+  "projects": { "category": "[[Projects]]" },
+  "branchLabel": "branch"
 }
 ```
 
 - `frontmatter` holds extra properties written into every new note; `null` writes an empty property.
+- `branchLabel` is the word in branch note titles: `<title> (branch 1)`.
 - `projects` turns on the project question. Leave it out if your vault has no project notes.
 
 ## Project of a conversation

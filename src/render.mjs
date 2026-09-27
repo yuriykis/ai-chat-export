@@ -50,7 +50,8 @@ export function sanitize(text) {
 const callout = (type, title, body) =>
   [`> [!${type}] ${title}`, ...body.split('\n').map((l) => (l ? `> ${l}` : '>'))].join('\n');
 
-function infoBox({ harness, cwd, models, messages }) {
+function infoBox(chat) {
+  const { harness, cwd, models, messages } = chat;
   const first = messages[0]?.ts ? new Date(messages[0].ts) : new Date();
   const count = (role) => messages.filter((m) => m.role === role).length;
   const rows = [
@@ -58,6 +59,7 @@ function infoBox({ harness, cwd, models, messages }) {
     cwd && ['Directory', `\`${cwd.replace(os.homedir(), '~')}\``],
     models.length && [models.length > 1 ? 'Models' : 'Model', models.join(', ')],
     ['Messages', `${count('user')} user, ${count('assistant')} assistant`],
+    chat.parentLink && ['Branch of', chat.parentLink],
   ].filter(Boolean);
   return callout('info', `${AGENT_NAMES[harness] ?? harness} session`, rows.map(([k, v]) => `**${k}:** ${v}  `).join('\n').trimEnd());
 }
@@ -65,16 +67,20 @@ function infoBox({ harness, cwd, models, messages }) {
 export function renderBody(chat) {
   const parts = [infoBox(chat)];
   let lastDay = ymd(chat.messages[0]?.ts ? new Date(chat.messages[0].ts) : new Date());
-  for (const m of chat.messages) {
+  // Lines linking to branches go right after the message the branch split off from.
+  const marksAfter = (i) => (chat.marks ?? []).filter((m) => m.after === i).map((m) => m.line);
+  parts.push(...marksAfter(-1));
+  chat.messages.forEach((m, i) => {
     if (m.role === 'assistant') {
       parts.push(sanitize(m.text));
-      continue;
+    } else {
+      const d = m.ts ? new Date(m.ts) : new Date();
+      const when = ymd(d) === lastDay ? hm(d) : `${ymd(d)} ${hm(d)}`;
+      lastDay = ymd(d);
+      parts.push(callout('quote', when, sanitize(m.text)));
     }
-    const d = m.ts ? new Date(m.ts) : new Date();
-    const when = ymd(d) === lastDay ? hm(d) : `${ymd(d)} ${hm(d)}`;
-    lastDay = ymd(d);
-    parts.push(callout('quote', when, sanitize(m.text)));
-  }
+    parts.push(...marksAfter(i));
+  });
   return `${parts.join('\n\n')}\n`;
 }
 

@@ -20,6 +20,7 @@ const DEFAULTS = {
   defaultTitle: 'Chat',
   frontmatter: {},
   projects: null,
+  branchLabel: 'branch',
 };
 
 export function loadConfig() {
@@ -36,9 +37,13 @@ export function loadConfig() {
 
 const markerPath = (harness, sid) => path.join(STATE_DIR, `${harness}--${sid}.json`);
 const loadMarker = (harness, sid) => JSON.parse(fs.readFileSync(markerPath(harness, sid), 'utf8'));
+const readMarker = (harness, sid) => { try { return loadMarker(harness, sid); } catch { return null; } };
+// A fork adds itself to its parent's `children` from another process; never drop an entry.
 const saveMarker = (m) => {
   fs.mkdirSync(STATE_DIR, { recursive: true });
-  fs.writeFileSync(markerPath(m.harness, m.sid), JSON.stringify(m, null, 2));
+  const children = [...(m.children ?? [])];
+  for (const c of readMarker(m.harness, m.sid)?.children ?? []) if (!children.some((x) => x.sid === c.sid)) children.push(c);
+  fs.writeFileSync(markerPath(m.harness, m.sid), JSON.stringify(children.length ? { ...m, children } : m, null, 2));
 };
 
 // --- which conversation --------------------------------------------------------------------------
@@ -83,22 +88,24 @@ function normalize(items, answeredAt) {
       const answer = afterSave && sentBefore(m) && !(next && sentBefore(next));
       afterSave = SAVE_COMMAND.test(text);
       skipping = afterSave || answer;
-      if (!skipping) out.push({ role: 'user', text, ts: m.ts });
+      if (!skipping) out.push({ role: 'user', text, ts: m.ts, uuid: m.uuid });
     } else if (!skipping) {
       const prev = out.at(-1);
       if (prev?.role === 'assistant') prev.text += `\n\n${text}`;
-      else out.push({ role: 'assistant', text, ts: m.ts, model: m.model });
+      else out.push({ role: 'assistant', text, ts: m.ts, model: m.model, uuid: m.uuid });
     }
   });
   const messages = out.filter((m, i) => !(m.role === 'user' && m.text.startsWith('/') && i < out.length - 1 && out[i + 1].role !== 'assistant'));
   return { messages, tailSkipped: skipping };
 }
 
-function collect(marker, { messages, prompt, reply, cwd }) {
+const modelsOf = (items) => [...new Set(items.map((m) => m.model).filter((m) => m && !m.startsWith('<')))];
+
+function collect(marker, { messages, prompt, reply, cwd }, live) {
   const h = harnesses[marker.harness];
   const parsed = messages
     ? { messages, cwd }
-    : marker.transcript && fs.existsSync(marker.transcript) ? h.parse(marker.transcript) : { messages: [] };
+    : live ?? (marker.transcript && fs.existsSync(marker.transcript) ? h.parse(marker.transcript) : { messages: [] });
   const { messages: items, tailSkipped } = normalize(parsed.messages, marker.answeredAt);
   // The Stop hook can run before the final reply reaches the transcript; the hook carries it too.
   // A reply to a left-out message (the save request, the project answer) stays out.
@@ -112,25 +119,44 @@ function collect(marker, { messages, prompt, reply, cwd }) {
   if (pending && !SAVE_COMMAND.test(pending) && items.findLast((m) => m.role === 'user')?.text !== pending) {
     items.push({ role: 'user', text: pending, ts: new Date().toISOString() });
   }
-  const models = [...new Set(items.map((m) => m.model).filter((m) => m && !m.startsWith('<')))];
-  return { harness: marker.harness, cwd: parsed.cwd ?? marker.cwd, models, messages: items };
+  return { harness: marker.harness, cwd: parsed.cwd ?? marker.cwd, models: modelsOf(items), messages: items };
 }
 
 // --- the note --------------------------------------------------------------------------------------
 
-// A note moved or renamed in Obsidian is found again by its `session` property.
-function locate(cfg, marker) {
-  if (fs.existsSync(marker.file)) return marker.file;
+// A note moved or renamed in Obsidian is found again by its `session` property, a branch note by
+// `session` and `branch` together.
+function locate(cfg, marker, branch = null) {
+  const known = branch ? marker.branches?.[branch]?.file : marker.file;
+  if (known && fs.existsSync(known)) return known;
   const dir = path.join(cfg.vault, cfg.folder);
-  const needle = `\nsession: ${yamlValue(`${marker.harness}:${marker.sid}`)}\n`;
+  const session = `\nsession: ${yamlValue(`${marker.harness}:${marker.sid}`)}\n`;
   for (const name of fs.existsSync(dir) ? fs.readdirSync(dir) : []) {
     const file = path.join(dir, name);
-    if (name.endsWith('.md') && fs.readFileSync(file, 'utf8').includes(needle)) return file;
+    if (!name.endsWith('.md')) continue;
+    const fm = fs.readFileSync(file, 'utf8').match(/^---\n[\s\S]*?\n---\n/)?.[0] ?? '';
+    if (!fm.includes(session)) continue;
+    if (branch ? fm.includes(`\nbranch: ${branch}\n`) : !fm.includes('\nbranch: ')) return file;
   }
   return null;
 }
 
+// Writes the body under the note's own frontmatter (or a new one); true if the file changed.
+function writeNote(file, body, frontmatter) {
+  if (fs.existsSync(file)) {
+    const old = fs.readFileSync(file, 'utf8');
+    const fm = old.match(/^---\n[\s\S]*?\n---\n/)?.[0];
+    if (fm && old.slice(fm.length).replace(/^\n/, '') === body) return false;
+    fs.writeFileSync(file, `${(fm ?? frontmatter()).replace(/^modified:.*$/m, `modified: ${ymd(new Date())}`)}\n${body}`);
+  } else {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, `${frontmatter()}\n${body}`);
+  }
+  return true;
+}
+
 function write(cfg, marker, input = {}) {
+  const h = harnesses[marker.harness];
   let file = locate(cfg, marker);
   if (!file) {
     // It was written before and is gone now: the owner deleted it. Do not bring it back.
@@ -139,22 +165,17 @@ function write(cfg, marker, input = {}) {
   }
   // Pi and OpenCode send the messages with each hook call. `start` and `stop` run without them, so
   // an existing note keeps its body instead of being rebuilt empty.
-  if (harnesses[marker.harness].pushed && !input.messages && fs.existsSync(file)) return file;
-  const body = renderBody(collect(marker, input));
-  const today = ymd(new Date());
-
-  let content;
-  if (fs.existsSync(file)) {
-    const old = fs.readFileSync(file, 'utf8');
-    const fm = old.match(/^---\n[\s\S]*?\n---\n/)?.[0];
-    if (fm && old.slice(fm.length).replace(/^\n/, '') === body) return file;
-    content = `${(fm ?? newFrontmatter(cfg, marker)).replace(/^modified:.*$/m, `modified: ${today}`)}\n${body}`;
-  } else {
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    content = `${newFrontmatter(cfg, marker)}\n${body}`;
+  if (h.pushed && !input.messages && fs.existsSync(file)) return file;
+  const paths = !input.messages && h.paths && marker.transcript && fs.existsSync(marker.transcript) ? h.paths(marker.transcript) : null;
+  const chat = collect(marker, input, paths?.[0]);
+  const next = { ...marker, file, written: true };
+  const notes = paths ? branchNotes(cfg, next, file, chat, paths) : [];
+  writeNote(file, renderBody(chat), () => newFrontmatter(cfg, marker));
+  // After the main note, so a new branch takes the projects the main note has now.
+  for (const note of notes) {
+    if (note.key) writeNote(note.file, renderBody(note.chat), () => branchFrontmatter(cfg, next, note.key, file));
   }
-  fs.writeFileSync(file, content);
-  if (file !== marker.file || !marker.written) saveMarker({ ...marker, file, written: true });
+  if (JSON.stringify(next) !== JSON.stringify(marker)) saveMarker(next);
   return file;
 }
 
@@ -166,6 +187,164 @@ function newFrontmatter(cfg, marker) {
     projects: marker.projects.map((p) => `[[${p}]]`),
     session: `${marker.harness}:${marker.sid}`,
   });
+}
+
+// --- branches -------------------------------------------------------------------------------------
+//
+// Claude Code keeps a conversation as a tree. The note always shows the live path; a branch left
+// behind by a rewind gets a note of its own with the messages after the point where it split off.
+// A fork (`--fork-session`) is a new session and a new note, recorded the same way from its split.
+// The split point in the note it came from gets a line linking to the branch, with a block id the
+// branch links back to.
+
+const noteName = (file) => path.basename(file, '.md');
+const branchLine = (file, anchor) => `↳ Branch: [[${noteName(file)}]] ^${anchor}`;
+const backLink = (file, anchor) => `[[${noteName(file)}#^${anchor}|${noteName(file)}]]`;
+
+function branchFile(cfg, of, taken) {
+  const label = cfg.branchLabel;
+  const base = noteName(of).replace(new RegExp(` \\(${label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} \\d+\\)$`), '');
+  for (let n = 1; ; n++) {
+    const file = path.join(cfg.vault, cfg.folder, `${base} (${label} ${n}).md`);
+    if (!fs.existsSync(file) && !taken.has(file)) { taken.add(file); return file; }
+  }
+}
+
+function branchFrontmatter(cfg, marker, key, mainFile) {
+  const today = ymd(new Date());
+  return renderFrontmatter({
+    created: today,
+    modified: today,
+    ...cfg.frontmatter,
+    projects: linkedProjects(frontmatterOf(mainFile)).map((p) => `[[${p}]]`),
+    session: `${marker.harness}:${marker.sid}`,
+    branch: key,
+  });
+}
+
+// Builds the branch notes of one session and puts the split-point lines (`marks`) into `chat` and
+// into them. Updates `marker.branches` and `marker.children` in place.
+function branchNotes(cfg, marker, file, chat, paths) {
+  const [live, ...rest] = paths;
+  const own = (ids, after) => new Set(after && ids.includes(after) ? ids.slice(ids.indexOf(after) + 1) : ids);
+  const main = { key: null, ids: live.ids, own: own(live.ids, marker.parent?.at), file, chat };
+  if (marker.parent) {
+    chat.messages = chat.messages.filter((m) => !m.uuid || main.own.has(m.uuid));
+    const parent = readMarker(marker.harness, marker.parent.sid);
+    const where = parent?.children?.find((c) => c.sid === marker.sid)?.note ?? marker.parent.note;
+    if (where) marker.parent = { ...marker.parent, note: where };
+    if (where && fs.existsSync(where)) chat.parentLink = backLink(where, `fork-${marker.sid.slice(0, 8)}`);
+  }
+  const notes = [main];
+  const marks = [];
+  const branches = { ...marker.branches };
+  const taken = new Set(Object.values(branches).map((b) => b.file).filter(Boolean));
+
+  for (const p of rest) {
+    // The note this path shares the longest start with is where it split off.
+    let parent = null;
+    let at = 0;
+    for (const n of notes) {
+      let k = 0;
+      while (k < p.ids.length && k < n.ids.length && p.ids[k] === n.ids[k]) k++;
+      if (k > at) { at = k; parent = n; }
+    }
+    if (!parent || at >= p.ids.length) continue;
+    const key = p.ids[at];
+    const mine = new Set(p.ids.slice(at));
+    const shown = normalize(p.messages, marker.answeredAt).messages.filter((m) => mine.has(m.uuid));
+    // Only a full exchange makes a branch; a message taken back before any reply does not.
+    const asked = shown.findIndex((m) => m.role === 'user');
+    if (asked < 0 || !shown.slice(asked).some((m) => m.role === 'assistant')) continue;
+    if (branches[key]?.deleted) continue;
+    let bfile = locate(cfg, { ...marker, branches }, key);
+    if (!bfile) {
+      if (branches[key]?.written) { branches[key] = { deleted: true }; continue; }
+      bfile = branches[key]?.file ?? branchFile(cfg, file, taken);
+    }
+    branches[key] = { file: bfile, written: true };
+    const anchor = `branch-${key.slice(0, 8)}`;
+    const note = {
+      key,
+      ids: p.ids,
+      own: mine,
+      file: bfile,
+      chat: { harness: marker.harness, cwd: p.cwd ?? chat.cwd, models: modelsOf(shown), messages: shown, parentLink: backLink(parent.file, anchor) },
+    };
+    notes.push(note);
+    marks.push({ note: parent, at: p.ids[at - 1], line: branchLine(bfile, anchor) });
+  }
+
+  const children = (marker.children ?? []).map((c) => {
+    // A fork that has just been adopted has no note yet, only the file it is about to write.
+    const fork = readMarker(marker.harness, c.sid);
+    const target = locate(cfg, fork ?? { harness: marker.harness, sid: c.sid, file: c.file ?? '' }) ?? (fork && !fork.written ? fork.file : null);
+    if (!target) return c;
+    const owner = notes.find((n) => n.own.has(c.at)) ?? main;
+    marks.push({ note: owner, at: c.at, line: branchLine(target, `fork-${c.sid.slice(0, 8)}`) });
+    return { ...c, file: target, note: owner.file };
+  });
+
+  // A split line goes right after the last message at or before the split point.
+  for (const n of notes) {
+    const index = new Map(n.ids.map((id, i) => [id, i]));
+    n.chat.marks = marks.filter((m) => m.note === n).map((m) => {
+      const limit = index.get(m.at) ?? -1;
+      const after = n.chat.messages.findLastIndex((x) => (index.get(x.uuid) ?? Infinity) <= limit);
+      return { after, line: m.line };
+    });
+  }
+  if (Object.keys(branches).length) marker.branches = branches;
+  if (children.length) marker.children = children;
+  return notes;
+}
+
+// A fork of a conversation being recorded is a new session holding a copy of it. It is recorded too,
+// if it was made after recording started; otherwise it is left alone like any other session.
+function adoptFork(harness, sid, input) {
+  const h = harnesses[harness];
+  const file = input.transcript_path;
+  if (!h.paths || !file || !fs.existsSync(file) || !fs.existsSync(STATE_DIR)) return false;
+  const recorded = fs.readdirSync(STATE_DIR).filter((n) => n.startsWith(`${harness}--`) && n.endsWith('.json'));
+  if (!recorded.length) return false;
+  const root = h.firstId(file);
+  if (!root) return false;
+  let mine = null;
+  let best = null;
+  for (const name of recorded) {
+    let m;
+    try { m = JSON.parse(fs.readFileSync(path.join(STATE_DIR, name), 'utf8')); } catch { continue; }
+    // Already adopted once: its note was deleted, so it stays unrecorded.
+    if (m.children?.some((c) => c.sid === sid)) return false;
+    if (m.sid === sid || !m.transcript || !fs.existsSync(m.transcript) || h.firstId(m.transcript) !== root) continue;
+    mine ??= h.paths(file)[0];
+    const theirs = h.ids(m.transcript);
+    let k = 0;
+    while (k < mine.ids.length && theirs.has(mine.ids[k])) k++;
+    if (k === 0 || k === mine.ids.length) continue;
+    if (Date.parse(mine.times[k]) < Date.parse(m.startedAt ?? m.created)) continue;
+    if (!best || k > best.k) best = { m, k, at: mine.ids[k - 1] };
+  }
+  if (!best) return false;
+  const cfg = loadConfig();
+  const parentFile = locate(cfg, best.m);
+  if (!parentFile) return false;
+  const now = new Date();
+  saveMarker({
+    harness,
+    sid,
+    transcript: file,
+    cwd: input.cwd ?? best.m.cwd,
+    projects: linkedProjects(frontmatterOf(parentFile)),
+    created: ymd(now),
+    startedAt: now.toISOString(),
+    file: branchFile(cfg, parentFile, new Set()),
+    written: false,
+    parent: { sid: best.m.sid, at: best.at },
+  });
+  saveMarker({ ...best.m, children: [...(best.m.children ?? []), { sid, at: best.at }] });
+  write(cfg, loadMarker(harness, best.m.sid));
+  return true;
 }
 
 // --- project of the conversation ------------------------------------------------------------------
@@ -287,6 +466,7 @@ export function start(opts) {
     cwd: process.cwd(),
     projects,
     created: ymd(now),
+    startedAt: now.toISOString(),
     file: uniqueFile(path.join(cfg.vault, cfg.folder), `${ymd(now)} ${title}`),
     written: false,
   };
@@ -344,7 +524,8 @@ export function hook(harness, input) {
   const h = harnesses[harness];
   if (!h) return '';
   const sid = input.session_id;
-  if (!sid || !fs.existsSync(markerPath(harness, sid))) return h.hookOutput(input.hook_event_name);
+  if (!sid) return h.hookOutput(input.hook_event_name);
+  if (!fs.existsSync(markerPath(harness, sid)) && !adoptFork(harness, sid, input)) return h.hookOutput(input.hook_event_name);
   const marker = loadMarker(harness, sid);
   if (input.transcript_path && input.transcript_path !== marker.transcript) {
     marker.transcript = input.transcript_path;

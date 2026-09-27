@@ -137,6 +137,9 @@ function write(cfg, marker, input = {}) {
     if (marker.written) { fs.rmSync(markerPath(marker.harness, marker.sid), { force: true }); return null; }
     file = marker.file;
   }
+  // Pi and OpenCode send the messages with each hook call. `start` and `stop` run without them, so
+  // an existing note keeps its body instead of being rebuilt empty.
+  if (harnesses[marker.harness].pushed && !input.messages && fs.existsSync(file)) return file;
   const body = renderBody(collect(marker, input));
   const today = ymd(new Date());
 

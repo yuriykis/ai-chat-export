@@ -142,6 +142,7 @@ const codex = {
 
 // --- Pi and OpenCode: messages arrive from their integrations -------------------------------------
 
-const pushed = { sessionEnv: [], findTranscript: () => null, parse: () => ({ messages: [] }), hookOutput: () => '' };
+// `pushed` marks that the messages come only with a hook call; without one there is nothing to read.
+const pushed = { pushed: true, sessionEnv: [], findTranscript: () => null, parse: () => ({ messages: [] }), hookOutput: () => '' };
 
 export const harnesses = { claude, codex, pi: pushed, opencode: pushed };

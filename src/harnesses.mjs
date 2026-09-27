@@ -82,7 +82,11 @@ function claudeMessages(chain) {
       out.push({ role: 'user', text: stripReminders(textBlocks(e.attachment.prompt, ['text'])), ts: e.timestamp, uuid: e.uuid });
     } else if (e.type === 'user') {
       if (Array.isArray(content) && content.some((b) => b.type === 'tool_result')) continue;
-      out.push({ role: 'user', text: claudeUserText(textBlocks(content, ['text'])), ts: e.timestamp, uuid: e.uuid });
+      const raw = textBlocks(content, ['text']);
+      // A built-in command (/exit, /model…) runs locally and its output follows it; it never gets a
+      // reply, so it is dropped even when it is the last thing in the session.
+      if (/<local-command-(stdout|stderr)>/.test(raw) && out.at(-1)?.command) { out.pop(); continue; }
+      out.push({ role: 'user', text: claudeUserText(raw), ts: e.timestamp, uuid: e.uuid, command: /<command-name>/.test(raw) });
     } else if (e.type === 'assistant' && e.message?.model !== '<synthetic>') {
       out.push({ role: 'assistant', text: stripReminders(textBlocks(content, ['text'])), ts: e.timestamp, model: e.message?.model, uuid: e.uuid });
     }

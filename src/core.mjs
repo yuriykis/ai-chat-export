@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { harnesses } from './harnesses.mjs';
-import { renderBody, renderFrontmatter, yamlValue, ymd } from './render.mjs';
+import { renderBody, renderFrontmatter, yamlField, yamlValue, ymd } from './render.mjs';
 
 const HOME = os.homedir();
 const CONFIG_FILE = path.join(process.env.XDG_CONFIG_HOME || path.join(HOME, '.config'), 'ai-chat-export/config.json');
@@ -19,7 +19,7 @@ const DEFAULTS = {
   folder: 'AI Chats',
   defaultTitle: 'Chat',
   frontmatter: {},
-  projects: { fromActiveNote: false, category: '[[Projects]]' },
+  projects: null,
 };
 
 export function loadConfig() {
@@ -29,7 +29,7 @@ export function loadConfig() {
   return {
     ...DEFAULTS,
     ...user,
-    projects: { ...DEFAULTS.projects, ...user.projects },
+    projects: user.projects ? { category: '[[Projects]]', ...user.projects } : DEFAULTS.projects,
     configFile: CONFIG_FILE,
   };
 }
@@ -65,23 +65,33 @@ export function resolveSession({ harness, session }) {
 const SAVE_COMMAND = /^(?:[/$](?:skill:)?save-chat\b|<skill[^>]*save-chat)/;
 
 // Only user messages and text replies. The save-chat request itself and the reply to it are left out,
-// as are built-in slash commands that got no reply (/model, /clear…).
-function normalize(items) {
+// as are built-in slash commands that got no reply (/model, /clear…). So is the owner's answer to the
+// "which project?" question when the agent asked it in the chat: the first message after the save
+// request, sent before `project` recorded the answer (`answeredAt`), and the reply to it.
+function normalize(items, answeredAt) {
+  const answered = answeredAt ? Date.parse(answeredAt) : NaN;
+  const sentBefore = (m) => Date.parse(m.ts) <= answered;
+  const isUser = (m) => m.role === 'user' && (m.text ?? '').trim();
   const out = [];
   let skipping = false;
-  for (const m of items) {
+  let afterSave = false;
+  items.forEach((m, i) => {
     const text = (m.text ?? '').trim();
-    if (!text || (m.role !== 'user' && m.role !== 'assistant')) continue;
+    if (!text || (m.role !== 'user' && m.role !== 'assistant')) return;
     if (m.role === 'user') {
-      skipping = SAVE_COMMAND.test(text);
+      const next = items.slice(i + 1).find(isUser);
+      const answer = afterSave && sentBefore(m) && !(next && sentBefore(next));
+      afterSave = SAVE_COMMAND.test(text);
+      skipping = afterSave || answer;
       if (!skipping) out.push({ role: 'user', text, ts: m.ts });
     } else if (!skipping) {
       const prev = out.at(-1);
       if (prev?.role === 'assistant') prev.text += `\n\n${text}`;
       else out.push({ role: 'assistant', text, ts: m.ts, model: m.model });
     }
-  }
-  return out.filter((m, i) => !(m.role === 'user' && m.text.startsWith('/') && i < out.length - 1 && out[i + 1].role !== 'assistant'));
+  });
+  const messages = out.filter((m, i) => !(m.role === 'user' && m.text.startsWith('/') && i < out.length - 1 && out[i + 1].role !== 'assistant'));
+  return { messages, tailSkipped: skipping };
 }
 
 function collect(marker, { messages, prompt, reply, cwd }) {
@@ -89,9 +99,10 @@ function collect(marker, { messages, prompt, reply, cwd }) {
   const parsed = messages
     ? { messages, cwd }
     : marker.transcript && fs.existsSync(marker.transcript) ? h.parse(marker.transcript) : { messages: [] };
-  const items = normalize(parsed.messages);
+  const { messages: items, tailSkipped } = normalize(parsed.messages, marker.answeredAt);
   // The Stop hook can run before the final reply reaches the transcript; the hook carries it too.
-  const last = reply?.trim();
+  // A reply to a left-out message (the save request, the project answer) stays out.
+  const last = tailSkipped ? '' : reply?.trim();
   if (last && items.length && !(items.at(-1).role === 'assistant' && items.at(-1).text.endsWith(last))) {
     if (items.at(-1).role === 'assistant') items.at(-1).text += `\n\n${last}`;
     else items.push({ role: 'assistant', text: last, ts: new Date().toISOString() });
@@ -155,15 +166,41 @@ function newFrontmatter(cfg, marker) {
 }
 
 // --- project of the conversation ------------------------------------------------------------------
+//
+// Never guessed: the owner names it, or `start` asks the agent to ask. The suggestions only order the
+// question — the project of an earlier chat from the same directory, then the note open in Obsidian.
 
 function frontmatterOf(file) {
   try { return fs.readFileSync(file, 'utf8').match(/^---\n([\s\S]*?)\n---/)?.[1] ?? ''; } catch { return ''; }
 }
 
-// Only for sessions started inside the vault: the note open in Obsidian (the `active` leaf of
-// workspace.json). If it is a project, that project; if it links `projects`, those; otherwise none.
-function detectProjects(cfg, cwd) {
-  if (!cfg.projects.fromActiveNote || !cwd.startsWith(cfg.vault)) return [];
+const PROJECTS_FIELD = /^projects:[^\n]*\n(?:[ \t]+-[^\n]*\n)*/m;
+const linkedProjects = (fm) =>
+  [...(`${fm}\n`.match(PROJECTS_FIELD)?.[0] ?? '').matchAll(/\[\[([^\]|#]+)/g)].map((m) => m[1].trim());
+
+// Every project note in the vault, by lower-cased name.
+function projectIndex(cfg) {
+  const category = cfg.projects.category.replace(/[[\]]/g, '');
+  const isProject = new RegExp(`^category:\\s*"?\\[\\[${category}\\]\\]"?\\s*$`, 'm');
+  const index = new Map();
+  const walk = (dir) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (e.name.startsWith('.')) continue;
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) walk(full);
+      else if (e.name.endsWith('.md')) {
+        const fm = frontmatterOf(full);
+        if (isProject.test(fm)) index.set(e.name.slice(0, -3).toLowerCase(), { name: e.name.slice(0, -3), active: /^status:.*\[\[Active\]\]/m.test(fm) });
+      }
+    }
+  };
+  walk(cfg.vault);
+  return index;
+}
+
+// The note open in Obsidian (the `active` leaf of workspace.json): itself if it is a project,
+// otherwise the projects it links.
+function openNoteProjects(cfg, index) {
   let ws;
   try { ws = JSON.parse(fs.readFileSync(path.join(cfg.vault, '.obsidian/workspace.json'), 'utf8')); } catch { return []; }
   const find = (node) => {
@@ -174,11 +211,49 @@ function detectProjects(cfg, cwd) {
   };
   const rel = find(ws)?.state?.state?.file;
   if (!rel?.endsWith('.md')) return [];
-  const fm = frontmatterOf(path.join(cfg.vault, rel));
-  const category = cfg.projects.category.replace(/[[\]]/g, '');
-  if (new RegExp(`^category:\\s*"?\\[\\[${category}\\]\\]"?\\s*$`, 'm').test(fm)) return [path.basename(rel, '.md')];
-  const list = fm.match(/^projects:[ \t]*\n((?:[ \t]+-.*\n?)*)/m)?.[1] ?? '';
-  return [...list.matchAll(/\[\[([^\]|#]+)/g)].map((m) => m[1]);
+  const own = path.basename(rel, '.md');
+  return index.has(own.toLowerCase()) ? [own] : linkedProjects(frontmatterOf(path.join(cfg.vault, rel)));
+}
+
+// The projects of the newest chat note recorded in the same directory that has any.
+function directoryProjects(cfg, cwd) {
+  const dir = path.join(cfg.vault, cfg.folder);
+  const needle = `**Directory:** \`${cwd.replace(HOME, '~')}\``;
+  const notes = (fs.existsSync(dir) ? fs.readdirSync(dir) : [])
+    .filter((n) => n.endsWith('.md'))
+    .map((n) => path.join(dir, n))
+    .sort((x, y) => fs.statSync(y).mtimeMs - fs.statSync(x).mtimeMs);
+  for (const file of notes) {
+    const text = fs.readFileSync(file, 'utf8');
+    if (!text.includes(needle)) continue;
+    const found = linkedProjects(text.match(/^---\n([\s\S]*?)\n---/)?.[1] ?? '');
+    if (found.length) return found;
+  }
+  return [];
+}
+
+function suggestProjects(cfg, cwd, index) {
+  const out = [];
+  const add = (names, why) => {
+    for (const n of names) {
+      const hit = index.get(n.toLowerCase());
+      if (hit && !out.some((s) => s.name === hit.name)) out.push({ name: hit.name, why });
+    }
+  };
+  add(directoryProjects(cfg, cwd), 'an earlier chat from this directory');
+  add(openNoteProjects(cfg, index), 'open in Obsidian');
+  return out.slice(0, 3);
+}
+
+// Project names as given by the agent or the owner, checked against the vault.
+function resolveProjects(cfg, names, index) {
+  const clean = names.map((n) => String(n).replace(/^\[\[|\]\]$/g, '').trim()).filter(Boolean);
+  const missing = clean.filter((n) => !index.has(n.toLowerCase()));
+  if (missing.length) {
+    const active = [...index.values()].filter((p) => p.active).map((p) => p.name).sort();
+    throw new Error(`No project note named ${missing.map((n) => `"${n}"`).join(', ')}. Active projects: ${active.join(', ')}.`);
+  }
+  return clean.map((n) => index.get(n.toLowerCase()).name);
 }
 
 // --- commands --------------------------------------------------------------------------------------
@@ -197,7 +272,9 @@ export function start(opts) {
     const file = write(cfg, loadMarker(harness, sid));
     if (file) return `Already saving this conversation to ${rel(file)}.`;
   }
-  const projects = detectProjects(cfg, process.cwd());
+  const index = cfg.projects && projectIndex(cfg);
+  const named = opts.project && opts.project !== true ? [opts.project] : [];
+  const projects = named.length ? resolveProjects(cfg, named, index) : [];
   const now = new Date();
   const title = (opts.title || projects[0] || cfg.defaultTitle).replace(/[\\/:*?"<>|#^[\]]/g, '').replace(/\s+/g, ' ').trim().slice(0, 100);
   const marker = {
@@ -212,7 +289,41 @@ export function start(opts) {
   };
   saveMarker(marker);
   const file = write(cfg, marker);
-  return `Saving this conversation to ${rel(file)}${projects.length ? ` (project: ${projects.join(', ')})` : ''}. Every new message is added as it happens.`;
+  const saving = `Saving this conversation to ${rel(file)}${projects.length ? ` (project: ${projects.join(', ')})` : ''}. Every new message is added as it happens.`;
+  if (!cfg.projects || projects.length) return saving;
+  const suggested = suggestProjects(cfg, marker.cwd, index);
+  return [
+    saving,
+    'No project is set. Ask the user which project this conversation belongs to, then run',
+    `\`ai-chat-export project --harness ${harness} "<project>"\` or \`ai-chat-export project --harness ${harness} --none\`.`,
+    suggested.length
+      ? `Suggestions: ${suggested.map((s) => `${s.name} (${s.why})`).join('; ')}.`
+      : 'No suggestions.',
+  ].join('\n');
+}
+
+// Sets the project after the owner answered the question `start` asked. Only the `projects`
+// property changes; the body follows on the next update, without the answer in it.
+export function project(opts) {
+  const cfg = loadConfig();
+  if (!cfg.projects) throw new Error(`Projects are off — add "projects" to ${cfg.configFile}.`);
+  const { harness, sid } = resolveSession(opts);
+  if (!fs.existsSync(markerPath(harness, sid))) throw new Error('This conversation is not being saved — start saving it first.');
+  if (!opts.none && !opts._.length) throw new Error('Give a project name, or --none for no project.');
+  const projects = opts.none ? [] : resolveProjects(cfg, opts._, projectIndex(cfg));
+  const marker = { ...loadMarker(harness, sid), projects, answeredAt: new Date().toISOString() };
+  saveMarker(marker);
+  const file = locate(cfg, marker);
+  if (file) {
+    const old = fs.readFileSync(file, 'utf8');
+    const fm = old.match(/^---\n[\s\S]*?\n---\n/)?.[0];
+    if (fm) {
+      const field = `${yamlField('projects', projects.map((p) => `[[${p}]]`))}\n`;
+      const next = PROJECTS_FIELD.test(fm) ? fm.replace(PROJECTS_FIELD, field) : fm.replace(/\n---\n$/, `\n${field}---\n`);
+      fs.writeFileSync(file, next + old.slice(fm.length));
+    }
+  }
+  return projects.length ? `Project set: ${projects.join(', ')}.` : 'Saving without a project.';
 }
 
 export function stop(opts) {

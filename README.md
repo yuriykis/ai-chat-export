@@ -10,7 +10,7 @@ Supported agents: **Claude Code**, **Codex CLI**, **Pi**, **OpenCode**.
 
 | Piece | What it does |
 |---|---|
-| `save-chat` skill | Tells the agent to run `ai-chat-export start --harness <agent> --title "…"` when you ask to save the chat, with a title it writes itself. |
+| `save-chat` skill | Tells the agent to run `ai-chat-export start --harness <agent> --title "…"` when you ask to save the chat, with a title it writes itself, and to ask you for the project. |
 | `ai-chat-export start` | Finds the current session (from the agent's session id in the environment), creates a marker for it and writes the note with everything said so far. |
 | Claude Code / Codex hooks | `UserPromptSubmit` and `Stop` run `ai-chat-export hook <agent>`. If the session is being recorded, the note is rebuilt from the agent's own transcript. |
 | Pi extension / OpenCode plugin | Do the same through the agents' extension APIs. They also export the session id to the agent's shell. |
@@ -51,17 +51,24 @@ git clone https://github.com/yuriykis/ai-chat-export ~/Projects/ai-chat-export
   "folder": "AI Chats",
   "defaultTitle": "Chat",
   "frontmatter": { "category": "[[AI Chats]]", "related": null },
-  "projects": { "fromActiveNote": true, "category": "[[Projects]]" }
+  "projects": { "category": "[[Projects]]" }
 }
 ```
 
 - `frontmatter` holds extra properties written into every new note; `null` writes an empty property.
-- `projects.fromActiveNote` only applies to sessions started inside the vault. When it is on, `projects` is filled from the note open in Obsidian: that note itself if its `category` is `projects.category`, otherwise the projects it links in `projects`.
+- `projects` turns on the project question. Leave it out if your vault has no project notes.
+
+## Project of a conversation
+
+With `projects` set, a new recording never guesses its project. If you said which project it is ("save this chat to Website redesign"), the agent passes `--project`. Otherwise `start` tells the agent to ask you, with up to three suggestions: the project of the newest earlier chat recorded in the same directory, and the project open in Obsidian (the note itself if its `category` is `projects.category`, otherwise the projects it links). Your answer is written with `ai-chat-export project`, which checks that the project note exists and sets the `projects` property.
+
+When the agent asks in the chat (Codex, Pi, OpenCode), your answer and its confirmation are left out of the note, like the save request itself. Claude Code asks in a dialog that never reaches the transcript.
 
 ## Commands
 
 ```
-ai-chat-export start [--harness claude|codex|pi|opencode] [--session ID] [--title TITLE]
+ai-chat-export start   [--harness claude|codex|pi|opencode] [--session ID] [--title TITLE] [--project NAME]
+ai-chat-export project [--harness …] [--session ID] (NAME… | --none)
 ai-chat-export stop  [--harness …] [--session ID]
 ai-chat-export hook <harness>        # used by the integrations; reads hook JSON on stdin
 ai-chat-export install [--vault PATH] [--folder NAME]

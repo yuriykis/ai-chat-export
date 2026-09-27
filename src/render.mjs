@@ -82,7 +82,7 @@ export function renderBody(chat) {
 export const yamlValue = (v) =>
   typeof v === 'string' && (/[[\]{}:#,&*!|>'"%@`]/.test(v) || v !== v.trim() || !v) ? JSON.stringify(v) : String(v);
 
-function yamlField(key, value) {
+export function yamlField(key, value) {
   if (value === null || value === undefined || (Array.isArray(value) && !value.length)) return `${key}:`;
   if (Array.isArray(value)) return `${key}:\n${value.map((v) => `  - ${yamlValue(v)}`).join('\n')}`;
   return `${key}: ${yamlValue(value)}`;

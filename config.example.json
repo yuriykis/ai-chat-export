@@ -3,5 +3,5 @@
   "folder": "AI Chats",
   "defaultTitle": "Chat",
   "frontmatter": {},
-  "projects": { "fromActiveNote": false, "category": "[[Projects]]" }
+  "projects": { "category": "[[Projects]]" }
 }

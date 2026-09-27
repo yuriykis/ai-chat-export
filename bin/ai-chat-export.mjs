@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
-import { hook, start, stop, STATE_DIR } from '../src/core.mjs';
+import { hook, project, start, stop, STATE_DIR } from '../src/core.mjs';
 import { install, uninstall } from '../src/install.mjs';
 
 const USAGE = `ai-chat-export — save a conversation with a coding agent to Obsidian, live.
 
-  ai-chat-export start [--harness claude|codex|pi|opencode] [--session ID] [--title TITLE]
+  ai-chat-export start [--harness claude|codex|pi|opencode] [--session ID] [--title TITLE] [--project NAME]
+  ai-chat-export project [--harness ...] [--session ID] (NAME... | --none)
   ai-chat-export stop  [--harness ...] [--session ID]
   ai-chat-export hook <harness>          (reads the agent's hook JSON on stdin)
   ai-chat-export install [--vault PATH] [--folder NAME]
@@ -16,7 +17,7 @@ function parseArgs(argv) {
   const opts = { _: [] };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a.startsWith('--')) opts[a.slice(2)] = argv[i + 1]?.startsWith('--') ? true : argv[++i];
+    if (a.startsWith('--')) opts[a.slice(2)] = argv[i + 1] === undefined || argv[i + 1].startsWith('--') || a === '--none' ? true : argv[++i];
     else opts._.push(a);
   }
   return opts;
@@ -33,6 +34,7 @@ try {
     const out = hook(opts._[0], input);
     if (out) process.stdout.write(out);
   } else if (cmd === 'start') console.log(start(opts));
+  else if (cmd === 'project') console.log(project(opts));
   else if (cmd === 'stop') console.log(stop(opts));
   else if (cmd === 'install') console.log(install(opts).join('\n') || 'Already installed.');
   else if (cmd === 'uninstall') console.log(uninstall().join('\n') || 'Nothing to remove.');

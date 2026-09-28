@@ -1,5 +1,5 @@
 // Turns a conversation into the Markdown body of an Obsidian note, laid out like Pi's session export:
-// a session info box on top, each of your messages in a grey box with its time, replies as plain text.
+// a session info box on top, each of your messages in an info callout with its time, replies as plain text.
 
 import os from 'node:os';
 
@@ -77,7 +77,7 @@ export function renderBody(chat) {
       const d = m.ts ? new Date(m.ts) : new Date();
       const when = ymd(d) === lastDay ? hm(d) : `${ymd(d)} ${hm(d)}`;
       lastDay = ymd(d);
-      parts.push(callout('quote', when, sanitize(m.text)));
+      parts.push(callout('info', when, sanitize(m.text)));
     }
     parts.push(...marksAfter(i));
   });

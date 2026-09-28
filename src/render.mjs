@@ -1,5 +1,5 @@
 // Turns a conversation into the Markdown body of an Obsidian note, laid out like Pi's session export:
-// a session info box on top, each of your messages in an info callout with its time, replies as plain text.
+// a session summary box on top, each of your messages in an info callout with its time, replies as plain text.
 
 import os from 'node:os';
 
@@ -61,7 +61,7 @@ function infoBox(chat) {
     ['Messages', `${count('user')} user, ${count('assistant')} assistant`],
     chat.parentLink && ['Branch of', chat.parentLink],
   ].filter(Boolean);
-  return callout('info', `${AGENT_NAMES[harness] ?? harness} session`, rows.map(([k, v]) => `**${k}:** ${v}  `).join('\n').trimEnd());
+  return callout('abstract', `${AGENT_NAMES[harness] ?? harness} session`, rows.map(([k, v]) => `**${k}:** ${v}  `).join('\n').trimEnd());
 }
 
 export function renderBody(chat) {
